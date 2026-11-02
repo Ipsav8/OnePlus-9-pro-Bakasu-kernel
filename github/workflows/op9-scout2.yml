@@ -1,0 +1,60 @@
+name: OnePlus 9 scout 2 (no compile)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "OnePlus source branch (Android 14)"
+        type: string
+        default: "oneplus/sm8350_u_14.0.0_oneplus9"
+
+permissions:
+  contents: read
+
+jobs:
+  scout:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: OnePlus source - configs and version
+        run: |
+          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git src
+          cd src
+          {
+            echo "## Kernel version lines (root Makefile)"; head -5 Makefile
+            echo "## build.config files at the top"; ls | grep -i build.config
+            echo "## Config files for this chip"
+            find arch/arm64/configs -iname '*lahaina*' -o -iname '*qgki*' -o -iname 'gki*' -o -iname '*oplus*' -o -iname '*oneplus*' | head -30
+            echo "## OplusKernelEnvConfig.mk"; head -25 OplusKernelEnvConfig.mk
+            echo "## last commit"; git log -1 --format='%h %ad %s' --date=short
+          } | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Official SUSFS for kernel 5.4
+        run: |
+          git clone --depth=1 -b kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          cd susfs
+          {
+            echo "## SUSFS kernel-5.4 files"; ls; ls kernel_patches 2>/dev/null | head -20
+            echo "## SUSFS version"; grep -rn "SUSFS_VERSION" kernel_patches/include 2>/dev/null | head -3
+          } | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: What SUSFS version BakaSU expects
+        run: |
+          git clone --depth=1 https://github.com/Baka-SU/BakaSU.git BakaSU
+          cd BakaSU
+          {
+            echo "## BakaSU head"; git log -1 --format='%h %ad' --date=short
+            echo "## SUSFS mentions in README/docs"
+            grep -rniE "susfs.{0,40}(v?[0-9]+\.[0-9]+)" README* docs 2>/dev/null | head -12
+            echo "## Version checks in the kernel part"
+            grep -rn "SUSFS_VERSION\|susfs_version\|SUSFS_MIN" kernel 2>/dev/null | head -12
+          } | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Feather kernel (SUSFS 2.2.0 backported to 5.4)
+        run: |
+          git clone --depth=1 https://github.com/one899/Feather-Kernel-SM8350.git feather
+          cd feather
+          {
+            echo "## Feather top level"; ls | head -30
+            echo "## files with susfs in the name"; find . -iname '*susfs*' -not -path './.git/*' | head -20
+            echo "## Feather defconfig hints"; find arch/arm64/configs -iname '*lahaina*' -o -iname '*feather*' | head -10
+          } | tee -a $GITHUB_STEP_SUMMARY
