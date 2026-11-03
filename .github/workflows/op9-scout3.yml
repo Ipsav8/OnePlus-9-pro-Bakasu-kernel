@@ -1,0 +1,68 @@
+name: OnePlus 9 scout 3 (toolchain + stock config, no compile)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "OnePlus source branch (Android 14)"
+        type: string
+        default: "oneplus/sm8350_u_14.0.0_oneplus9"
+      kernel_hash:
+        description: "Hash from your stock kernel version"
+        type: string
+        default: "d2a1055adeb0"
+
+permissions:
+  contents: read
+
+jobs:
+  scout:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get the OnePlus source
+        run: |
+          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git src
+          ls op9-stock.config
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi bc bison flex libssl-dev libelf-dev cpio zip curl git python3 libncurses5 lz4
+
+      - name: Find the stock compiler (Android clang 11, r383902b)
+        run: |
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          FOUND=""
+          for BR in android11-release android11-qpr1-release android11-qpr2-release android11-qpr3-release master-kernel-build-2020 master-kernel-build-2021 android11-gsi; do
+            U="$BASE/$BR/clang-r383902b.tar.gz"
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -r 0-1023 "$U")
+            echo "$BR -> HTTP $CODE" | tee -a $GITHUB_STEP_SUMMARY
+            if [ "$CODE" = "200" ] || [ "$CODE" = "206" ]; then FOUND="$U"; break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "NO CANDIDATE WORKED" | tee -a $GITHUB_STEP_SUMMARY; exit 1; fi
+          mkdir -p $HOME/aclang
+          curl -fL "$FOUND" | tar -xz -C $HOME/aclang
+          echo "$HOME/aclang/bin" >> $GITHUB_PATH
+          echo "Using $FOUND" | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Compiler check
+        run: |
+          clang --version | head -2 | tee -a $GITHUB_STEP_SUMMARY
+          ld.lld --version | head -1 | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Apply the stock config with that compiler (no compile)
+        run: |
+          cd src
+          mkdir -p out
+          cp ../op9-stock.config out/.config
+          echo "-g${{ inputs.kernel_hash }}" > .scmversion
+          ARGS="O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          make $ARGS olddefconfig 2>&1 | tail -15
+          {
+            echo "## Kernel release this build would report"
+            make $ARGS -s kernelrelease 2>&1 | tail -2
+            echo "## Stock release for comparison: 5.4.254-qgki-g${{ inputs.kernel_hash }}"
+            echo "## Config lines that changed after olddefconfig (stock vs now)"
+            diff <(grep -E '^CONFIG_|^# CONFIG_' ../op9-stock.config) <(grep -E '^CONFIG_|^# CONFIG_' out/.config) | grep -E '^[<>]' | head -40
+            echo "## LTO / CFI / SCS still on?"
+            grep -E '^CONFIG_(LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES)=' out/.config
+          } | tee -a $GITHUB_STEP_SUMMARY
