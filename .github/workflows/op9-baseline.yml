@@ -42,6 +42,7 @@ jobs:
           mkdir -p kernel/msm-5.4
           rsync -aH ksrc/ kernel/msm-5.4/
           rm -rf ksrc
+          find kernel/msm-5.4 -name 'Kconfig*' -exec sed -i 's/\r$//' {} +
           echo "KDIR=$HOME/ob/kernel/msm-5.4" >> $GITHUB_ENV
           {
             echo "## Build directory top level"; ls
@@ -70,16 +71,21 @@ jobs:
           mkdir -p out
           cp "$GITHUB_WORKSPACE/op9-stock.config" out/.config
           echo "-g${{ inputs.kernel_hash }}" > .scmversion
-          ARGS="O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          ARGS="O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-"
           echo "ARGS=$ARGS" >> $GITHUB_ENV
           clang --version | head -1
-          make $ARGS olddefconfig 2>&1 | tee ../../olddefconfig.log | tail -15
+          make $ARGS olddefconfig 2>&1 | tee ../../olddefconfig.log | tail -5
+          printf '# CONFIG_RELR is not set\nCONFIG_OPLUS_FINGERPRINT=y\n' > ../../extra.fragment
+          scripts/kconfig/merge_config.sh -m -O out out/.config ../../extra.fragment > /dev/null 2>&1
+          make $ARGS olddefconfig 2>&1 | tee -a ../../olddefconfig.log | tail -5
           {
             echo "## Kernel release this build reports"
             make $ARGS -s kernelrelease 2>&1 | tail -1
             echo "## Stock release: 5.4.254-qgki-g${{ inputs.kernel_hash }}"
             echo "## Config lines that changed after olddefconfig (stock vs now)"
             diff <(grep -E '^CONFIG_|^# CONFIG_' "$GITHUB_WORKSPACE/op9-stock.config") <(grep -E '^CONFIG_|^# CONFIG_' out/.config) | grep -E '^[<>]' | head -40
+            echo "## Fingerprint, RELR, compat vdso now"
+            grep -E 'FINGERPRINT|RELR|COMPAT_VDSO' out/.config
             echo "## LTO / CFI / SCS / modversions"
             grep -E '^CONFIG_(LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES)=' out/.config
           } | tee -a $GITHUB_STEP_SUMMARY
@@ -103,7 +109,9 @@ jobs:
         run: |
           mkdir -p $GITHUB_WORKSPACE/results
           cp "$KDIR/out/.config" $GITHUB_WORKSPACE/results/final.config 2>/dev/null || true
-          cp "$KDIR/out/include/config/kernel.release" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          export PATH=$HOME/aclang/bin:$PATH
+          (cd "$KDIR" && make $ARGS -s kernelrelease 2>/dev/null | tail -1 > $GITHUB_WORKSPACE/results/kernel.release) || true
+          cp "$KDIR/out/include/config/kernel.release" $GITHUB_WORKSPACE/results/kernel.release.compiled 2>/dev/null || true
           cp "$KDIR/out/Module.symvers" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
           cp "$KDIR/out/arch/arm64/boot/Image.gz" "$KDIR/out/arch/arm64/boot/Image" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
           cp $HOME/ob/build.log $HOME/ob/olddefconfig.log $GITHUB_WORKSPACE/results/ 2>/dev/null || true
