@@ -1,125 +1,113 @@
-name: OnePlus 9 baseline (stock source + stock compiler)
 
-on:
-  workflow_dispatch:
-    inputs:
-      build_image:
-        description: "Also compile the kernel (slow). Leave off to only test the setup."
-        type: boolean
-        default: false
-      branch:
-        description: "OnePlus source branch (Android 14)"
-        type: string
-        default: "oneplus/sm8350_u_14.0.0_oneplus9"
-      kernel_hash:
-        description: "Hash from your stock kernel version"
-        type: string
-        default: "d2a1055adeb0"
+op9-pro-bakasu-kernel
+Repository navigation
+Code
+Issues
+Pull requests
+OnePlus 9 baseline (stock source + stock compiler)
+OnePlus 9 baseline (stock source + stock compiler) #3
+Manually triggered 23 minutes ago
+@Ipsav8Ipsav8
+⁠
+ 200cf36
+main
+Status
+Success
+Total duration
+7m 38s
+Artifacts
+1
 
-permissions:
-  contents: read
 
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
+build summary
+Build directory top level
+device
+kernel
+vendor
 
-      - name: Free disk space and install tools
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi bc bison flex libssl-dev libelf-dev cpio zip curl git python3 libncurses5 lz4 rsync
+kernel/msm-5.4 has sched_assist Kconfig?
+kernel/msm-5.4/kernel/sched_assist/Kconfig
 
-      - name: Assemble the source (kernel repo + modules/devicetree repo)
-        run: |
-          mkdir -p $HOME/ob && cd $HOME/ob
-          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git mods
-          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git ksrc
-          rm -rf mods/.git ksrc/.git
-          rsync -aH mods/ ./
-          rm -rf mods
-          mkdir -p kernel/msm-5.4
-          rsync -aH ksrc/ kernel/msm-5.4/
-          rm -rf ksrc
-          find kernel/msm-5.4 -name 'Kconfig*' -exec sed -i 's/\r$//' {} +
-          echo "KDIR=$HOME/ob/kernel/msm-5.4" >> $GITHUB_ENV
-          {
-            echo "## Build directory top level"; ls
-            echo "## kernel/msm-5.4 has sched_assist Kconfig?"; ls kernel/msm-5.4/kernel/sched_assist/Kconfig
-          } | tee -a $GITHUB_STEP_SUMMARY
+Kernel release this build reports
+5.4.254-qgki-gd2a1055adeb0
 
-      - name: Get the stock compiler (Android clang 11, r383902b)
-        run: |
-          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
-          FOUND=""
-          for BR in android11-qpr1-release android11-release android11-qpr2-release android11-qpr3-release master-kernel-build-2020 master-kernel-build-2021; do
-            U="$BASE/$BR/clang-r383902b.tar.gz"
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' -r 0-1023 "$U")
-            echo "$BR -> HTTP $CODE"
-            if [ "$CODE" = "200" ] || [ "$CODE" = "206" ]; then FOUND="$U"; break; fi
-          done
-          [ -n "$FOUND" ] || { echo "No compiler download worked"; exit 1; }
-          mkdir -p $HOME/aclang
-          curl -fL "$FOUND" | tar -xz -C $HOME/aclang
-          echo "$HOME/aclang/bin" >> $GITHUB_PATH
+Stock release: 5.4.254-qgki-gd2a1055adeb0
+Config lines that changed after olddefconfig (stock vs now)
+< CONFIG_CC_VERSION_TEXT="Android (6877366 based on r383902b1) clang version 11.0.2 (https://android.googlesource.com/toolchain/llvm-project b397f81060ce6d701042b782172ed13bee898b79)"
 
-      - name: Apply the stock config
-        run: |
-          export PATH=$HOME/aclang/bin:$PATH
-          cd "$KDIR"
-          mkdir -p out
-          cp "$GITHUB_WORKSPACE/op9-stock.config" out/.config
-          echo "-g${{ inputs.kernel_hash }}" > .scmversion
-          ARGS="O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-"
-          echo "ARGS=$ARGS" >> $GITHUB_ENV
-          clang --version | head -1
-          make $ARGS olddefconfig 2>&1 | tee ../../olddefconfig.log | tail -5
-          printf '# CONFIG_RELR is not set\nCONFIG_OPLUS_FINGERPRINT=y\n' > ../../extra.fragment
-          scripts/kconfig/merge_config.sh -m -O out out/.config ../../extra.fragment > /dev/null 2>&1
-          make $ARGS olddefconfig 2>&1 | tee -a ../../olddefconfig.log | tail -5
-          {
-            echo "## Kernel release this build reports"
-            make $ARGS -s kernelrelease 2>&1 | tail -1
-            echo "## Stock release: 5.4.254-qgki-g${{ inputs.kernel_hash }}"
-            echo "## Config lines that changed after olddefconfig (stock vs now)"
-            diff <(grep -E '^CONFIG_|^# CONFIG_' "$GITHUB_WORKSPACE/op9-stock.config") <(grep -E '^CONFIG_|^# CONFIG_' out/.config) | grep -E '^[<>]' | head -40
-            echo "## Fingerprint, RELR, compat vdso now"
-            grep -E 'FINGERPRINT|RELR|COMPAT_VDSO' out/.config
-            echo "## LTO / CFI / SCS / modversions"
-            grep -E '^CONFIG_(LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES)=' out/.config
-          } | tee -a $GITHUB_STEP_SUMMARY
+CONFIG_CC_VERSION_TEXT="Android (6573524 based on r383902b) clang version 11.0.2 (https://android.googlesource.com/toolchain/llvm-project b397f81060ce6d701042b782172ed13bee898b79)"
+CONFIG_TOOLS_SUPPORT_RELR=y
 
-      - name: Compile the kernel
-        if: ${{ inputs.build_image }}
-        run: |
-          export PATH=$HOME/aclang/bin:$PATH
-          cd "$KDIR"
-          set -o pipefail
-          make -j$(nproc) $ARGS Image.gz 2>&1 | tee ../../build.log | tail -5
+CONFIG_RELR is not set
+< # CONFIG_OPLUS_FEATURE_VIRTUAL_NET is not set
+< # CONFIG_OPLUS_FEATURE_ESTABLISH_REPORT is not set
+< CONFIG_OPPO_FINGERPRINT=y
+< CONFIG_OPPO_FINGERPRINT_COMMON=y
+< CONFIG_OPPO_FINGERPRINT_QCOM=y
+< # CONFIG_OPPO_FINGERPRINT_MTK is not set
+< # CONFIG_OPPO_FINGERPRINT_FPC is not set
+< # CONFIG_OPPO_FINGERPRINT_GOODIX is not set
+< CONFIG_OPPO_FINGERPRINT_GOODIX_OPTICAL=y
+< # CONFIG_OPPO_FINGERPRINT_SILEAD_OPTICAL is not set
+< # CONFIG_OPPO_FINGERPRINT_EGIS_OPTICAL is not set
+< CONFIG_OPLUS_FINGERPRINT_SILEAD=y
+< CONFIG_OPPO_FINGERPRINT_JIIOV_OPTICAL=y
+< # CONFIG_OPPO_FINGERPRINT_NAVIGATION_ENABLE is not set
 
-      - name: Show the real error
-        if: failure()
-        run: |
-          cd $HOME/ob
-          grep -nE "error:|Error [0-9]+|undefined|can't open|No such file" build.log olddefconfig.log 2>/dev/null | head -30
+CONFIG_OPLUS_FINGERPRINT=y
 
-      - name: Collect results
-        if: always()
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/results
-          cp "$KDIR/out/.config" $GITHUB_WORKSPACE/results/final.config 2>/dev/null || true
-          export PATH=$HOME/aclang/bin:$PATH
-          (cd "$KDIR" && make $ARGS -s kernelrelease 2>/dev/null | tail -1 > $GITHUB_WORKSPACE/results/kernel.release) || true
-          cp "$KDIR/out/include/config/kernel.release" $GITHUB_WORKSPACE/results/kernel.release.compiled 2>/dev/null || true
-          cp "$KDIR/out/Module.symvers" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
-          cp "$KDIR/out/arch/arm64/boot/Image.gz" "$KDIR/out/arch/arm64/boot/Image" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
-          cp $HOME/ob/build.log $HOME/ob/olddefconfig.log $GITHUB_WORKSPACE/results/ 2>/dev/null || true
-          ls -l $GITHUB_WORKSPACE/results
+CONFIG_OPLUS_FINGERPRINT_COMMON is not set
+CONFIG_OPLUS_FINGERPRINT_QCOM is not set
+CONFIG_OPLUS_FINGERPRINT_MTK is not set
+CONFIG_OPLUS_FINGERPRINT_FPC is not set
+CONFIG_OPLUS_FINGERPRINT_GOODIX is not set
+CONFIG_OPLUS_FINGERPRINT_GOODIX_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_SILEAD_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_EGIS_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_SILEAD is not set
+CONFIG_OPLUS_FINGERPRINT_JIIOV_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_NAVIGATION_ENABLE is not set
+< # CONFIG_OPPO_WAKELOCK_PROFILER is not set
+< # CONFIG_OPPO_POWER_QCOM is not set
+< # CONFIG_OPPO_POWER_MTK is not set
+< CONFIG_OPPO_ARCH_FILE=y
+< # CONFIG_OPPO_COMMON_SOFT is not set
+< CONFIG_OPPO_DEVICE_IFNO=y
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: op9-baseline-results
-          include-hidden-files: true
-          path: results/
+CONFIG_OPLUS_ARCH_FILE=y
+
+CONFIG_OPLUS_COMMON_SOFT is not set
+CONFIG_OPLUS_DEVICE_IFNO=y
+< CONFIG_OPLUS_DEVICE_IFNO=y
+
+Fingerprint, RELR, compat vdso now
+CONFIG_TOOLS_SUPPORT_RELR=y
+CONFIG_ARCH_HAS_RELR=y
+
+CONFIG_RELR is not set
+CONFIG_OPLUS_FINGERPRINT=y
+
+CONFIG_OPLUS_FINGERPRINT_COMMON is not set
+CONFIG_OPLUS_FINGERPRINT_QCOM is not set
+CONFIG_OPLUS_FINGERPRINT_MTK is not set
+CONFIG_OPLUS_FINGERPRINT_FPC is not set
+CONFIG_OPLUS_FINGERPRINT_GOODIX is not set
+CONFIG_OPLUS_FINGERPRINT_GOODIX_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_SILEAD_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_EGIS_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_SILEAD is not set
+CONFIG_OPLUS_FINGERPRINT_JIIOV_OPTICAL is not set
+CONFIG_OPLUS_FINGERPRINT_NAVIGATION_ENABLE is not set
+CONFIG_UFF_FINGERPRINT=m
+CONFIG_OPLUS_FINGERPRINT_GKI_ENABLE=y
+CONFIG_UFF_FINGERPRINT_QCOM=y
+
+CONFIG_UFF_FINGERPRINT_MTK is not set
+CONFIG_UFF_FINGERPRINT_ENABLE_TEE_BINDERCORE is not set
+CONFIG_UFF_FINGERPRINT_REE_SPI is not set
+LTO / CFI / SCS / modversions
+CONFIG_KPROBES=y
+CONFIG_SHADOW_CALL_STACK=y
+CONFIG_LTO_CLANG=y
+CONFIG_CFI_CLANG=y
+CONFIG_MODVERSIONS=y
