@@ -1,0 +1,101 @@
+name: OnePlus 9 SUSFS scout (no compile)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "OnePlus source branch (Android 14)"
+        type: string
+        default: "oneplus/sm8350_u_14.0.0_oneplus9"
+      bakasu_ref:
+        description: "BakaSU commit (d5e9e025 = the version that worked on your OnePlus 6)"
+        type: string
+        default: "d5e9e025"
+
+permissions:
+  contents: read
+
+jobs:
+  scout:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Assemble the OnePlus source (same as the baseline build)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq rsync
+          mkdir -p $HOME/ob && cd $HOME/ob
+          git clone -q --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git mods
+          git clone -q --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git ksrc
+          rm -rf mods/.git ksrc/.git
+          rsync -aH mods/ ./ && rm -rf mods
+          mkdir -p kernel/msm-5.4 && rsync -aH ksrc/ kernel/msm-5.4/ && rm -rf ksrc
+          find kernel/msm-5.4 -name 'Kconfig*' -exec sed -i 's/\r$//' {} +
+          echo "KDIR=$HOME/ob/kernel/msm-5.4" >> $GITHUB_ENV
+
+      - name: Get BakaSU and the three SUSFS candidates
+        run: |
+          cd $HOME
+          git clone -q https://github.com/Baka-SU/BakaSU.git BakaSU
+          git -C BakaSU checkout -q ${{ inputs.bakasu_ref }}
+          git clone -q --depth=1 -b kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git susfs-official
+          git clone -q --depth=1 https://github.com/fabiannabil1/susfs-4.19-nongki.git port419
+          git clone -q --depth=1 https://github.com/one899/Feather-Kernel-SM8350.git feather
+          ls susfs-official/kernel_patches port419/patches/*/ | head -20
+
+      - name: Try the 4.19 SUSFS v2.3.0 patch on the OnePlus 9 source
+        run: |
+          cd "$KDIR"
+          P=$(ls $HOME/port419/patches/*/0002-susfs-v2.3.0-4.19.patch | head -1)
+          echo "files in patch: $(grep -c '^diff --git' "$P")" | tee -a $GITHUB_STEP_SUMMARY
+          git apply --reject --whitespace=nowarn "$P" > $HOME/apply419.log 2>&1 || true
+          {
+            echo "## 4.19 v2.3.0 patch on the OnePlus 9 source"
+            echo "files with rejected pieces: $(find . -name '*.rej' | wc -l)"
+            find . -name '*.rej' | sort | head -40
+            echo "files missing: $(grep -c 'No such file' $HOME/apply419.log)"
+          } | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Which SUSFS version can BakaSU actually use
+        run: |
+          python3 - << 'PYEOF'
+          import re, os, glob, subprocess
+          home = os.environ["HOME"]
+          rx = re.compile(r"\bsusfs_[a-z0-9_]+")
+          def names_in(paths):
+              s = set()
+              for p in paths:
+                  try: s |= set(rx.findall(open(p, errors="ignore").read()))
+                  except Exception: pass
+              return s
+          used = set()
+          for root, _, files in os.walk(home + "/BakaSU/kernel"):
+              for f in files:
+                  if f.endswith((".c", ".h")):
+                      used |= names_in([os.path.join(root, f)])
+          out = ["## SUSFS names BakaSU uses: %d" % len(used)]
+          def defined_in_tree(base):
+              return names_in(glob.glob(base + "/include/linux/susfs*.h") + glob.glob(base + "/fs/susfs*.c"))
+          cands = {
+            "official kernel-5.4 (v1.5.x)": names_in(glob.glob(home + "/susfs-official/kernel_patches/include/linux/*.h") + glob.glob(home + "/susfs-official/kernel_patches/fs/*.c")),
+            "Feather backport (2.2.0)": defined_in_tree(home + "/feather"),
+          }
+          patch = glob.glob(home + "/port419/patches/*/0002-susfs-v2.3.0-4.19.patch")[0]
+          cands["4.19 port (v2.3.0)"] = names_in([patch])
+          for k, v in cands.items():
+              missing = sorted(used - v)
+              out.append("### %s -> missing %d" % (k, len(missing)))
+              out += missing[:25]
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write("\n".join(out) + "\n")
+          print("\n".join(out))
+          PYEOF
+
+      - name: Can Feather's SUSFS be turned into a patch? (history)
+        run: |
+          cd $HOME
+          git clone -q --filter=blob:none --no-checkout https://github.com/one899/Feather-Kernel-SM8350.git feather-hist
+          cd feather-hist
+          {
+            echo "## Feather: commits that touch fs/susfs.c (oldest first)"
+            git log --format='%h %ad %s' --date=short --reverse -- fs/susfs.c | head -8
+            echo "## Feather: commits mentioning susfs: $(git log -i --grep=susfs --format=%h | wc -l)"
+            git log -i --grep=susfs --format='%h %s' | head -15
+          } | tee -a $GITHUB_STEP_SUMMARY
