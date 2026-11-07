@@ -41,7 +41,7 @@ on:
         default: "84b59863f272"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -421,6 +421,74 @@ jobs:
         with:
           name: ${{ env.ZIPNAME }}
           path: ${{ env.ZIPNAME }}.zip
+
+      - name: Publish a GitHub Release
+        if: ${{ inputs.build_image }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd "$KDIR"
+          SHA=$(sha256sum "$GITHUB_WORKSPACE/$ZIPNAME.zip" | cut -d' ' -f1)
+          if grep -q '^CONFIG_THINLTO=y' out/.config; then LTO="ThinLTO"; elif grep -q '^CONFIG_LTO_CLANG=y' out/.config; then LTO="LTO"; else LTO="none"; fi
+          TCPCC=$(grep '^CONFIG_DEFAULT_TCP_CONG=' out/.config | cut -d'"' -f2)
+          TAG="op9-$(date -u +%Y%m%d-%H%M)-${{ github.run_number }}"
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            cat > $GITHUB_WORKSPACE/release-notes.md << NOTES
+          OnePlus 9 / 9 Pro kernel for OxygenOS 14 (Android 14)
+
+          **INFO**
+          - Kernel: $KREL
+          - Kernel source: OnePlusOSS/android_kernel_oneplus_sm8350, branch ${{ inputs.branch }}
+          - Root: BakaSU, commit ${{ inputs.bakasu_ref }}
+          - SUSFS: v2.3.0, SUSFS Inline Hooks
+          - LTO: $LTO
+          - TCP congestion control: $TCPCC
+          - Devices: lemonadep (OnePlus 9 Pro), lemonade (OnePlus 9)
+          - SHA256: \`$SHA\`
+
+          **DOWNLOADS**
+          - \`$ZIPNAME.zip\` — flash this to your boot partition
+          - Install or update the BakaSU manager APK separately; it is not attached here
+
+          **⚠️ WARNINGS**
+          - Only for a ROM whose kernel version starts with \`5.4.254-qgki-g${{ inputs.kernel_hash }}\`. Flashing on a different OxygenOS build can bootloop the phone.
+          - Back up your current boot image first (Kernel Flasher → Backup, or your custom recovery's backup option). This zip also makes its own backup to \`Download/boot_backup_*.img\`, but keep your own copy too.
+          - This is a community/unofficial build. Flash at your own risk — not responsible for bootloops, data loss, or bricked devices.
+          - Keep a stock \`boot.img\` on your PC and know how to reach fastboot, in case the flash fails.
+
+          **INSTALL**
+          1. Install or update the BakaSU manager APK.
+          2. Flash the AnyKernel3 zip with Kernel Flasher or your custom recovery.
+          3. Reboot.
+          4. Open the BakaSU manager and confirm it shows "Working" and the correct kernel/SUSFS version.
+
+          **IF IT DOESN'T BOOT**
+          Flash your stock \`boot.img\` from fastboot to recover, then open an issue here with what happened.
+
+          Source and build recipe: this repository, workflow \`op9-bakasu-v8-build.yml\`
+          NOTES
+          else
+            cat > $GITHUB_WORKSPACE/release-notes.md << NOTES
+          OnePlus 9 / 9 Pro baseline kernel (no root) for OxygenOS 14 (Android 14)
+
+          - Kernel: $KREL
+          - Kernel source: OnePlusOSS/android_kernel_oneplus_sm8350, branch ${{ inputs.branch }}
+          - LTO: $LTO
+          - TCP congestion control: $TCPCC
+          - SHA256: \`$SHA\`
+
+          **⚠️ WARNINGS**
+          - Only for a ROM whose kernel version starts with \`5.4.254-qgki-g${{ inputs.kernel_hash }}\`.
+          - Back up your boot image first. Flash at your own risk.
+
+          Source and build recipe: this repository, workflow \`op9-bakasu-v8-build.yml\`
+          NOTES
+          fi
+          gh release create "$TAG" "$GITHUB_WORKSPACE/$ZIPNAME.zip" \
+            --title "$ZIPNAME ($KREL)" \
+            --notes-file "$GITHUB_WORKSPACE/release-notes.md" \
+            --prerelease
 
       - name: Collect results
         if: always()
