@@ -485,6 +485,7 @@ jobs:
           Source and build recipe: this repository, workflow \`op9-bakasu-v8-build.yml\`
           NOTES
           fi
+          cd "$GITHUB_WORKSPACE"
           gh release create "$TAG" "$GITHUB_WORKSPACE/$ZIPNAME.zip" \
             --title "$ZIPNAME ($KREL)" \
             --notes-file "$GITHUB_WORKSPACE/release-notes.md" \
