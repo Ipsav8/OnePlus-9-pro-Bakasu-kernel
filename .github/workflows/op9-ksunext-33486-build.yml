@@ -1,0 +1,543 @@
+name: OnePlus 9 / 9 Pro kernel v9 (KernelSU-Next v3.4.2-131-gd9b862bb, 33486 + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_root:
+        description: "Add KernelSU-Next + SUSFS (false = plain baseline kernel)"
+        type: boolean
+        default: true
+      build_image:
+        description: "Actually compile (slow, ~1h). Leave off to only test the patching."
+        type: boolean
+        default: true
+      branch:
+        description: "OnePlus source branch (Android 14)"
+        type: string
+        default: "oneplus/sm8350_u_14.0.0_oneplus9"
+      kernel_hash:
+        description: "Hash from your stock kernel version"
+        type: string
+        default: "d2a1055adeb0"
+      ksu_repo:
+        description: "KernelSU-Next repo (SUSFS-enabled fork; official: https://github.com/KernelSU-Next/KernelSU-Next.git)"
+        type: string
+        default: "https://github.com/pershoot/KernelSU-Next.git"
+      ksu_ref:
+        description: "Commit matching your manager APK (d9b862bb = KernelSU_Next_v3.4.2-131-gd9b862bb_33486). Use a branch name for latest tip."
+        type: string
+        default: "d9b862bb"
+      expect_describe:
+        description: "Expected 'git describe' of that commit, must match the manager APK name (empty = skip check)"
+        type: string
+        default: "v3.4.2-131-gd9b862bb"
+      susfs_repo:
+        description: "SM8350 5.4 tree that already has SUSFS v2.3.0 + BakaSU hooks"
+        type: string
+        default: "https://github.com/aospa-vili/pixel_kernel_xiaomi_sm8350.git"
+      susfs_tag:
+        description: "Tag or branch of that tree to fetch"
+        type: string
+        default: "v2026.11.01-bakasu-susfs-nomount"
+      hooks_commit:
+        description: "Commit: treewide BakaSU manual hooks (applied first)"
+        type: string
+        default: "f60b37e13494"
+      susfs_commit:
+        description: "Commit: SuSFS v2.3.0 + BakaSU inline hooks (applied second)"
+        type: string
+        default: "84b59863f272"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space and install tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi bc bison flex libssl-dev libelf-dev cpio zip curl git python3 libncurses5 lz4 rsync patch
+
+      - name: Assemble the OnePlus source
+        run: |
+          mkdir -p $HOME/ob && cd $HOME/ob
+          git clone -q --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git mods
+          git clone -q --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git ksrc
+          rm -rf mods/.git ksrc/.git
+          rsync -aH mods/ ./ && rm -rf mods
+          mkdir -p kernel/msm-5.4 && rsync -aH ksrc/ kernel/msm-5.4/ && rm -rf ksrc
+          find -L . -name 'Kconfig*' -type f -exec sed -i 's/\r$//' {} +
+          echo "KDIR=$HOME/ob/kernel/msm-5.4" >> $GITHUB_ENV
+
+      - name: Add KernelSU-Next
+        if: ${{ inputs.with_root }}
+        run: |
+          set -e
+          cd $HOME
+          git clone -q "${{ inputs.ksu_repo }}" KSUN
+          git -C KSUN checkout -q "${{ inputs.ksu_ref }}" || { echo "ref ${{ inputs.ksu_ref }} not found in ${{ inputs.ksu_repo }} - try the official repo https://github.com/KernelSU-Next/KernelSU-Next.git"; exit 1; }
+          KSU_SHA=$(git -C KSUN rev-parse HEAD)
+          DESC=$(git -C KSUN describe --tags --always 2>/dev/null || echo unknown)
+          echo "git describe: $DESC"
+          if [ -n "${{ inputs.expect_describe }}" ]; then
+            case "$DESC" in
+              *"${{ inputs.expect_describe }}"*) echo "Version matches the manager APK" ;;
+              *) echo "MISMATCH: this repo/ref is '$DESC' but the manager APK is '${{ inputs.expect_describe }}'."; echo "Point ksu_repo at the repo the APK was built from (or fix ksu_ref)."; exit 1 ;;
+            esac
+          fi
+          KSU_COUNT=$(git -C KSUN rev-list --count HEAD)
+          echo "KSU_SHA=$KSU_SHA" >> $GITHUB_ENV
+          git -C KSUN log -1 --format='KernelSU-Next at %H %s'
+          {
+            echo "## KernelSU-Next"
+            echo "- repo: ${{ inputs.ksu_repo }}"
+            echo "- ref: ${{ inputs.ksu_ref }} -> $KSU_SHA"
+            echo "- commit count: $KSU_COUNT (manager and kernel versions must match; build the manager from the same commit/CI run)"
+          } | tee -a $GITHUB_STEP_SUMMARY
+          cd "$KDIR"
+          test -d "$HOME/KSUN/kernel" || { echo "no kernel/ directory in this KernelSU-Next ref"; ls "$HOME/KSUN"; exit 1; }
+          ln -sfn "$HOME/KSUN/kernel" drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          python3 - << 'PYEOF'
+          p = "drivers/Kconfig"
+          s = open(p).read()
+          if 'source "drivers/kernelsu/Kconfig"' not in s:
+              i = s.rfind("endmenu")
+              assert i != -1, "drivers/Kconfig has no endmenu"
+              s = s[:i] + 'source "drivers/kernelsu/Kconfig"\n' + s[i:]
+              open(p, "w").write(s)
+              print("drivers/Kconfig: added kernelsu source line")
+          PYEOF
+          test -f drivers/kernelsu/Kconfig || { echo "KernelSU-Next link is broken or has no Kconfig:"; ls -la drivers/kernelsu "$HOME/KSUN" | head -30; exit 1; }
+          # the SUSFS options this workflow turns on must exist in this ref's Kconfig
+          for SYM in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SUS_MAP KSU_SUSFS_OPEN_REDIRECT; do
+            grep -rq "config $SYM\b" drivers/kernelsu/ || echo "WARNING: $SYM not defined in this KernelSU-Next ref (SUSFS glue missing or renamed)"
+          done
+          echo "KernelSU-Next linked:"; ls drivers/kernelsu/ | head -30
+
+      - name: Cut the hook and SUSFS patches from the SM8350 tree
+        if: ${{ inputs.with_root }}
+        run: |
+          set -e
+          mkdir -p $HOME/patches
+          cd $HOME
+          git clone -q --depth=40 --filter=blob:none --no-checkout --branch "${{ inputs.susfs_tag }}" "${{ inputs.susfs_repo }}" susfs-src
+          cd susfs-src
+          git log --oneline | head -15
+          EXC=(':(exclude)KernelSU' ':(exclude)drivers/kernelsu' ':(exclude)drivers/Makefile' ':(exclude)drivers/Kconfig' ':(exclude)arch/arm64/configs' ':(exclude).github' ':(exclude)anykernel' ':(exclude)localversion*' ':(exclude)*.md' ':(exclude).gitmodules')
+          i=0
+          for C in ${{ inputs.hooks_commit }} ${{ inputs.susfs_commit }}; do
+            i=$((i+1))
+            git rev-parse --verify -q "$C^{commit}" > /dev/null || { echo "commit $C not found in the fetched history"; exit 1; }
+            git log -1 --format="== $C: %s" "$C"
+            git diff "$C^" "$C" -- . "${EXC[@]}" > "$HOME/patches/0$i-$C.patch"
+            git diff --stat "$C^" "$C" -- . "${EXC[@]}" > "$HOME/patches/0$i-$C.stat"
+            echo "files in patch: $(grep -c '^diff --git' $HOME/patches/0$i-$C.patch)"
+            tail -45 "$HOME/patches/0$i-$C.stat"
+          done
+
+      - name: Apply the patches (strict, then fuzzy retry for rejected hunks)
+        if: ${{ inputs.with_root }}
+        run: |
+          set -e
+          cd "$KDIR"
+          retry_rejects() {
+            for rej in $(find . -name '*.rej' | sort); do
+              f="${rej#./}"; f="${f%.rej}"
+              tmp=$(mktemp)
+              printf -- '--- a/%s\n+++ b/%s\n' "$f" "$f" > "$tmp"
+              tail -n +2 "$rej" >> "$tmp"
+              if patch -p1 --fuzz=3 --forward --no-backup-if-mismatch -i "$tmp" > /tmp/fuzz.out 2>&1; then
+                echo "FUZZY OK: $f"; rm -f "$rej"
+              else
+                echo "FUZZY FAILED: $f"; cat /tmp/fuzz.out | tail -8
+              fi
+              rm -f "$tmp" "$f.orig"
+            done
+          }
+          for P in $(ls $HOME/patches/*.patch | sort); do
+            echo "############ applying $P"
+            git apply --reject --whitespace=nowarn "$P" || true
+            retry_rejects
+          done
+          find . -name '*.orig' -delete
+
+          # task_mmu.c: donor tree uses VMA_PAD_START (missing here) and the show_smap() hunk can land in __show_smap()
+          python3 - << 'PYEOF'
+          import re
+          p = "fs/proc/task_mmu.c"
+          s = open(p).read()
+          # donor tree has VMA_PAD_START (vma padding); this tree does not
+          s = s.replace("VMA_PAD_START(vma)", "vma->vm_end")
+          # the show_smap() hunk can land in __show_smap(); remove it wherever it landed, then re-add in show_smap()
+          blk = re.compile(r'#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif \(vma->vm_file\) \{\n\t\tif \(SUSFS_IS_INODE_SUS_MAP\(file_inode\(vma->vm_file\)\)\)\n\t\t\treturn 0;\n\t\}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n?')
+          s, n = blk.subn("", s)
+          print("task_mmu.c: removed", n, "misplaced SUS_MAP block(s)")
+          good = ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\treturn 0;\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n")
+          st = s.find("static int show_smap(")
+          assert st != -1, "show_smap() not found"
+          en = s.find("\n}\n", st)
+          body = s[st:en]
+          if "SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))" not in body:
+              m = re.search(r'\n\tmemset\(&mss, 0, sizeof\(mss\)\);\n\n?', body) or re.search(r'\n\tstruct vm_area_struct \*vma = v;\n(?:\tstruct mem_size_stats mss;\n)?\n?', body)
+              assert m, "no anchor in show_smap()"
+              body = body[:m.end()] + good + body[m.end():]
+              s = s[:st] + body + s[en:]
+              print("task_mmu.c: SUS_MAP check placed in show_smap()")
+          assert "VMA_PAD_START" not in s
+          open(p, "w").write(s)
+          PYEOF
+
+          # show_smap() returns int here; a bare "return;" would not compile
+          python3 - << 'PYEOF'
+          import re
+          p = "fs/proc/task_mmu.c"
+          s = open(p).read()
+          st = s.find("static int show_smap(")
+          if st != -1:
+              en = s.find("\n}\n", st)
+              body = s[st:en]
+              new = re.sub(r'(\n[ \t]*)return;', r'\1return 0;', body)
+              if new != body:
+                  open(p, "w").write(s[:st] + new + s[en:])
+                  print("task_mmu.c: fixed bare return in show_smap()")
+          PYEOF
+
+          # fs/proc/fd.c: our kernel's seq_show() differs from the donor tree, so the
+          # SUSFS hunk cannot match. Rebuild the hunk around OUR seq_printf statement.
+          python3 - << 'PYEOF'
+          import re, os
+          p = "fs/proc/fd.c"
+          s = open(p).read()
+          if "susfs_sus_kstat_spoof_proc_fd_seq_show(&" in s:
+              print("fd.c: SUSFS block already present")
+          else:
+              m = re.search(r'[ \t]*seq_printf\(m,\s*"pos:.*?\);\n', s, re.S)
+              assert m, "fd.c: seq_printf(pos:) not found"
+              orig = m.group(0)
+              def sub(txt, mnt, ino):
+                  txt = txt.replace("real_mount(file->f_path.mnt)->mnt_id", mnt)
+                  txt = txt.replace("file_inode(file)->i_ino", ino)
+                  return txt.strip()
+              kstat_print = sub(orig, "mnt_id", "ino")
+              mount_print = sub(orig, "susfs_get_non_sus_mnt_id_from_mnt(mnt)", "d_backing_inode(path.dentry)->i_ino")
+              head = (
+              "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n"
+              "\tif (susfs_is_current_app_uid()) {\n"
+              "\t\tstruct inode *inode = file_inode(file);\n"
+              "\t\tbool is_fuse = false;\n"
+              "\t\tif (susfs_is_inode_sus_kstat(inode, &is_fuse)) {\n"
+              "\t\t\tint mnt_id = real_mount(file->f_path.mnt)->mnt_id;\n"
+              "\t\t\tunsigned long ino = inode->i_ino;\n"
+              "\t\t\tsusfs_sus_kstat_spoof_proc_fd_seq_show(&mnt_id, &ino, inode->i_sb->s_dev);\n"
+              "\t\t\t" + kstat_print + "\n"
+              "\t\t\tgoto bypass_orig_flow;\n"
+              "\t\t}\n"
+              "\t}\n"
+              "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n"
+              "\n"
+              "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+              "\tif (likely(susfs_is_current_proc_umounted())) {\n"
+              "\t\tstruct mount *mnt = real_mount(file->f_path.mnt);\n"
+              "\t\tif (mnt->mnt_id >= DEFAULT_KSU_MNT_ID) {\n"
+              "\t\t\tstruct path path;\n"
+              "\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n"
+              "\t\t\tchar *dpath;\n"
+              "\n"
+              "\t\t\tif (!pathname)\n"
+              "\t\t\t\tgoto orig_flow;\n"
+              "\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n"
+              "\t\t\tif (IS_ERR_OR_NULL(dpath))\n"
+              "\t\t\t\tgoto out_kfree;\n"
+              "\t\t\tif (kern_path(dpath, 0, &path))\n"
+              "\t\t\t\tgoto out_kfree;\n"
+              "\t\t\tif (!d_backing_inode(path.dentry))\n"
+              "\t\t\t\tgoto out_path_put;\n"
+              "\n"
+              "\t\t\t" + mount_print + "\n"
+              "\t\t\tpath_put(&path);\n"
+              "\t\t\tkfree(pathname);\n"
+              "\t\t\tgoto bypass_orig_flow;\n"
+              "out_path_put:\n"
+              "\t\t\tpath_put(&path);\n"
+              "out_kfree:\n"
+              "\t\t\tkfree(pathname);\n"
+              "\t\t\tgoto orig_flow;\n"
+              "\t\t}\n"
+              "\t}\n"
+              "\n"
+              "orig_flow:\n"
+              "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+              "\n")
+              tail = (
+              "\n"
+              "#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)\n"
+              "bypass_orig_flow:\n"
+              "#endif\n"
+              "\n")
+              s = s[:m.start()] + head + orig + tail + s[m.end():]
+              open(p, "w").write(s)
+              print("fd.c: SUSFS block inserted around:", orig.strip()[:70])
+          for junk in ("fs/proc/fd.c.rej", "fs/proc/fd.c.orig"):
+              if os.path.exists(junk):
+                  os.remove(junk)
+          PYEOF
+
+          remaining=$(find . -name '*.rej' | sort)
+          if [ -n "$remaining" ]; then
+            echo "STILL REJECTED (the info artifact has the full text in rejects/):"
+            for f in $remaining; do echo "=========== $f ==========="; cat "$f"; done
+            exit 1
+          fi
+          test -f fs/susfs.c && echo "fs/susfs.c present"
+          # SUSFS commit re-guards every hook with CONFIG_KSU_SUSFS; no MANUAL_HOOK guard may survive
+          LEFT=$(grep -rln 'CONFIG_KSU_MANUAL_HOOK' fs kernel security drivers/input mm include 2>/dev/null || true)
+          [ -z "$LEFT" ] || { echo "Leftover MANUAL_HOOK guards (hooks would be dead):"; echo "$LEFT"; exit 1; }
+          grep -q 'ksu_handle_execveat' fs/exec.c || { echo "exec hook missing in fs/exec.c"; exit 1; }
+          echo "Hook sanity OK"
+          test -f include/linux/susfs.h && echo "include/linux/susfs.h present"
+
+      - name: Restore cached compiler
+        id: clangcache
+        uses: actions/cache@v4
+        with:
+          path: ~/aclang
+          key: aclang-r383902b
+
+      - name: Get the stock compiler (Android clang 11, r383902b)
+        if: steps.clangcache.outputs.cache-hit != 'true'
+        run: |
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          mkdir -p $HOME/aclang
+          OK=""
+          # googlesource sometimes answers 503: retry the whole list a few times
+          for ROUND in 1 2 3 4 5; do
+            for BR in android11-qpr1-release android11-release android11-qpr2-release android11-qpr3-release master-kernel-build-2020 master-kernel-build-2021; do
+              U="$BASE/$BR/clang-r383902b.tar.gz"
+              echo "round $ROUND: $BR"
+              rm -f /tmp/clang.tgz
+              if curl -fL --retry 3 --retry-all-errors --retry-delay 5 -o /tmp/clang.tgz "$U" && gzip -t /tmp/clang.tgz; then
+                OK=1; break 2
+              fi
+            done
+            echo "all sources failed in round $ROUND, waiting 60s"
+            sleep 60
+          done
+          [ -n "$OK" ] || { echo "No compiler download worked after 5 rounds"; exit 1; }
+          tar -xzf /tmp/clang.tgz -C $HOME/aclang
+          rm -f /tmp/clang.tgz
+          test -x $HOME/aclang/bin/clang || { echo "clang binary missing after extract"; exit 1; }
+
+      - name: Put the compiler on PATH
+        run: |
+          echo "$HOME/aclang/bin" >> $GITHUB_PATH
+          $HOME/aclang/bin/clang --version | head -1
+
+      - name: Apply the stock config (+ SUSFS options if root is on)
+        run: |
+          export PATH=$HOME/aclang/bin:$PATH
+          cd "$KDIR"
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/op9-stock.config" out/.config
+          echo "-g${{ inputs.kernel_hash }}" > .scmversion
+          ARGS="O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-"
+          echo "ARGS=$ARGS" >> $GITHUB_ENV
+          make $ARGS olddefconfig 2>&1 | tee ../../olddefconfig.log | tail -5
+          printf '# CONFIG_RELR is not set\nCONFIG_OPLUS_FINGERPRINT=y\nCONFIG_OPLUS_FINGERPRINT_COMMON=y\nCONFIG_OPLUS_FINGERPRINT_QCOM=y\nCONFIG_OPLUS_FINGERPRINT_GOODIX_OPTICAL=y\nCONFIG_OPLUS_FINGERPRINT_SILEAD=y\nCONFIG_OPLUS_FINGERPRINT_JIIOV_OPTICAL=y\n' > ../../extra.fragment
+          scripts/kconfig/merge_config.sh -m -O out out/.config ../../extra.fragment > /dev/null 2>&1
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            printf 'CONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\nCONFIG_KSU_SUSFS_SUS_PATH=y\nCONFIG_KSU_SUSFS_SUS_MOUNT=y\nCONFIG_KSU_SUSFS_SUS_KSTAT=y\nCONFIG_KSU_SUSFS_SPOOF_UNAME=y\nCONFIG_KSU_SUSFS_ENABLE_LOG=y\nCONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y\nCONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y\nCONFIG_KSU_SUSFS_OPEN_REDIRECT=y\nCONFIG_KSU_SUSFS_SUS_MAP=y\n# CONFIG_KSU_SAMSUNG_KDP is not set\n# CONFIG_KSU_SAMSUNG_RKP is not set\n# CONFIG_KSU_SAMSUNG_DEFEX is not set\n# CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT is not set\n' > ../../susfs.fragment
+            scripts/kconfig/merge_config.sh -m -O out out/.config ../../susfs.fragment > /dev/null 2>&1
+          fi
+          make $ARGS olddefconfig 2>&1 | tee -a ../../olddefconfig.log | tail -5
+          KREL=$(make $ARGS -s kernelrelease 2>/dev/null | tail -n 1)
+          [ -n "$KREL" ] || { echo "could not read kernelrelease"; exit 1; }
+          echo "KREL=$KREL" >> $GITHUB_ENV
+          {
+            echo "## Kernel release this build would report"
+            make $ARGS -s kernelrelease 2>&1 | tail -1
+            echo "## Stock release: 5.4.254-qgki-g${{ inputs.kernel_hash }}"
+            echo "## Fingerprint / RELR / LTO / CFI / modversions now"
+            grep -E 'FINGERPRINT|RELR|LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES' out/.config
+          } | tee -a $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            grep -E "^CONFIG_KSU(_SUSFS)?=y" out/.config || { echo "KSU/SUSFS CONFIG DID NOT STICK:"; grep -i ksu out/.config | head -30; exit 1; }
+            for SYM in CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SUS_MAP CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
+              grep -q "^$SYM=y" out/.config || { echo "$SYM did not stick (SUSFS code would be compiled out):"; grep -n -i 'hook\|ksu' out/.config | head -40; exit 1; }
+            done
+            echo "Root config OK: SUSFS options all set" | tee -a $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Compile the kernel
+        if: ${{ inputs.build_image }}
+        run: |
+          export PATH=$HOME/aclang/bin:$PATH
+          cd "$KDIR"
+          set -o pipefail
+          make -k -j$(nproc) $ARGS Image.gz 2>&1 | tee ../../build.log | tail -5
+
+      - name: Show the real error
+        if: failure()
+        run: |
+          cd $HOME/ob
+          grep -nE "error:|Error [0-9]+|undefined|can't open|No such file" build.log olddefconfig.log 2>/dev/null | head -30
+
+      - name: Package with AnyKernel3
+        if: ${{ inputs.build_image }}
+        run: |
+          set -e
+          # the built image must report exactly the release we expect
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            # KernelSU-Next: verify the driver and hook entry points were really compiled in
+            test -f "$KDIR/out/drivers/kernelsu/built-in.a" || test -f "$KDIR/out/drivers/kernelsu/ksu.o" || { echo "KernelSU-Next driver was not built"; ls "$KDIR/out/drivers/kernelsu" 2>/dev/null; exit 1; }
+            for H in ksu_handle_execveat ksu_handle_faccessat ksu_handle_vfs_read ksu_handle_input_handle_event; do
+              grep -q "$H" "$KDIR/fs/exec.c" "$KDIR/fs/open.c" "$KDIR/fs/read_write.c" "$KDIR/drivers/input/input.c" 2>/dev/null || echo "NOTE: hook $H not found in the usual file (may be named differently in this ref)"
+            done
+            test -f "$KDIR/out/fs/susfs.o" || { echo "fs/susfs.o was not built"; exit 1; }
+          fi
+          zcat "$KDIR/out/arch/arm64/boot/Image.gz" | grep -a -q "Linux version $KREL " || { echo "Built image does not report $KREL"; exit 1; }
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/README.md
+          cp "$KDIR/out/arch/arm64/boot/Image.gz" ak3/
+          cat > ak3/anykernel.sh << 'AKEOF'
+          properties() { '
+          kernel.string=OnePlus 9 / 9 Pro KernelSU-Next + SUSFS kernel (@KREL@)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=lemonadep
+          device.name2=lemonade
+          device.name3=OnePlus9Pro
+          device.name4=OnePlus9
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+
+          # (kernel-release guard removed: it could not read the version from this boot image)
+
+          # best-effort backup of the current boot partition (only when storage is mounted)
+          if [ -d /sdcard/Download ] && [ -n "$block" ]; then
+            BK=/sdcard/Download/boot_backup_$(date +%Y%m%d_%H%M%S).img;
+            dd if="$block" of="$BK" bs=1048576 2>/dev/null && ui_print "Backed up current boot to $BK" || ui_print "Boot backup skipped";
+          fi;
+
+          write_boot;
+          AKEOF
+          sed -i "s|@KREL@|$KREL|g" ak3/anykernel.sh
+          grep -n "KREL\|Linux version" ak3/anykernel.sh | head
+          if [ "${{ inputs.with_root }}" = "true" ]; then N=OP9-KSUNext-SUSFS-kernel; else N=OP9-baseline-kernel; fi
+          echo "ZIPNAME=$N" >> $GITHUB_ENV
+          cd ak3 && zip -r9 ../$N.zip . -x '.git*'
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.build_image }}
+        with:
+          name: ${{ env.ZIPNAME }}
+          path: ${{ env.ZIPNAME }}.zip
+
+      - name: Publish a GitHub Release
+        if: ${{ inputs.build_image }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd "$KDIR"
+          SHA=$(sha256sum "$GITHUB_WORKSPACE/$ZIPNAME.zip" | cut -d' ' -f1)
+          if grep -q '^CONFIG_THINLTO=y' out/.config; then LTO="ThinLTO"; elif grep -q '^CONFIG_LTO_CLANG=y' out/.config; then LTO="LTO"; else LTO="none"; fi
+          TCPCC=$(grep '^CONFIG_DEFAULT_TCP_CONG=' out/.config | cut -d'"' -f2)
+          TAG="op9-$(date -u +%Y%m%d-%H%M)-${{ github.run_number }}"
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            cat > $GITHUB_WORKSPACE/release-notes.md << NOTES
+          OnePlus 9 / 9 Pro kernel for OxygenOS 14 (Android 14)
+
+          **INFO**
+          - Kernel: $KREL
+          - Kernel source: OnePlusOSS/android_kernel_oneplus_sm8350, branch ${{ inputs.branch }}
+          - Root: KernelSU-Next, ${{ inputs.ksu_repo }} @ $KSU_SHA
+          - SUSFS: inline hooks (see workflow patches)
+          - LTO: $LTO
+          - TCP congestion control: $TCPCC
+          - Devices: lemonadep (OnePlus 9 Pro), lemonade (OnePlus 9)
+          - SHA256: \`$SHA\`
+
+          **DOWNLOADS**
+          - \`$ZIPNAME.zip\` — flash this to your boot partition
+          - Install the KernelSU-Next manager built from the same commit/CI run; it is not attached here
+
+          **⚠️ WARNINGS**
+          - Only for a ROM whose kernel version starts with \`5.4.254-qgki-g${{ inputs.kernel_hash }}\`. Flashing on a different OxygenOS build can bootloop the phone.
+          - Back up your current boot image first (Kernel Flasher → Backup, or your custom recovery's backup option). This zip also makes its own backup to \`Download/boot_backup_*.img\`, but keep your own copy too.
+          - This is a community/unofficial build. Flash at your own risk — not responsible for bootloops, data loss, or bricked devices.
+          - Keep a stock \`boot.img\` on your PC and know how to reach fastboot, in case the flash fails.
+
+          **INSTALL**
+          1. Install the matching KernelSU-Next manager APK.
+          2. Flash the AnyKernel3 zip with Kernel Flasher or your custom recovery.
+          3. Reboot.
+          4. Open the KernelSU-Next manager and confirm it shows "Working" and the correct kernel/SUSFS version.
+
+          **IF IT DOESN'T BOOT**
+          Flash your stock \`boot.img\` from fastboot to recover, then open an issue here with what happened.
+
+          Source and build recipe: this repository, workflow \`op9-ksunext-build.yml\`
+          NOTES
+          else
+            cat > $GITHUB_WORKSPACE/release-notes.md << NOTES
+          OnePlus 9 / 9 Pro baseline kernel (no root) for OxygenOS 14 (Android 14)
+
+          - Kernel: $KREL
+          - Kernel source: OnePlusOSS/android_kernel_oneplus_sm8350, branch ${{ inputs.branch }}
+          - LTO: $LTO
+          - TCP congestion control: $TCPCC
+          - SHA256: \`$SHA\`
+
+          **⚠️ WARNINGS**
+          - Only for a ROM whose kernel version starts with \`5.4.254-qgki-g${{ inputs.kernel_hash }}\`.
+          - Back up your boot image first. Flash at your own risk.
+
+          Source and build recipe: this repository, workflow \`op9-ksunext-build.yml\`
+          NOTES
+          fi
+          cd "$GITHUB_WORKSPACE"
+          gh release create "$TAG" "$GITHUB_WORKSPACE/$ZIPNAME.zip" \
+            --title "$ZIPNAME ($KREL)" \
+            --notes-file "$GITHUB_WORKSPACE/release-notes.md"
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/results
+          cp "$KDIR/out/.config" $GITHUB_WORKSPACE/results/final.config 2>/dev/null || true
+          cp $HOME/ob/olddefconfig.log $HOME/ob/build.log $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          mkdir -p $GITHUB_WORKSPACE/results/rejects
+          (cd "$KDIR" 2>/dev/null && find . -name '*.rej' | while read -r r; do cp "$r" "$GITHUB_WORKSPACE/results/rejects/$(echo "$r" | sed 's|^\./||; s|/|__|g')"; done) || true
+          cp "$KDIR/out/arch/arm64/boot/Image.gz" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          cp $HOME/patches/*.patch $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          cp $HOME/patches/*.stat $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          ls -l $GITHUB_WORKSPACE/results 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: op9-bakasu-build-info
+          include-hidden-files: true
+          path: results/
+          if-no-files-found: ignore
