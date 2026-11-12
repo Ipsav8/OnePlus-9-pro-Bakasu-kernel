@@ -1,0 +1,534 @@
+name: OnePlus 9 / 9 Pro kernel v14 (KernelSU-Next dev + SUSFS 2.2.0)
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_root:
+        description: "Add KernelSU-Next + SUSFS (false = plain baseline kernel)"
+        type: boolean
+        default: true
+      build_image:
+        description: "Actually compile (slow, ~1h). Leave off to only test the patching."
+        type: boolean
+        default: true
+      branch:
+        description: "OnePlus source branch (Android 14)"
+        type: string
+        default: "oneplus/sm8350_u_14.0.0_oneplus9"
+      kernel_hash:
+        description: "Hash from your stock kernel version"
+        type: string
+        default: "d2a1055adeb0"
+      ksu_repo:
+        description: "KernelSU-Next repo"
+        type: string
+        default: "https://github.com/KernelSU-Next/KernelSU-Next.git"
+      ksu_ref:
+        description: "KernelSU-Next branch/tag/commit. dev = what the latest CI manager is built from. For an exact match give the commit hash shown in the manager version (e.g. 3987e4d5)"
+        type: string
+        default: "dev"
+      ksu_susfs_patch_url:
+        description: "Optional URL of a patch that adds SUSFS to KernelSU-Next (empty = 10_enable_susfs_for_ksu.patch from the susfs repo)"
+        type: string
+        default: ""
+      susfs_repo:
+        description: "simonpunk susfs4ksu (has the kernel-5.4 branch)"
+        type: string
+        default: "https://gitlab.com/simonpunk/susfs4ksu.git"
+      susfs_ref:
+        description: "Branch with the 5.4 kernel patches"
+        type: string
+        default: "kernel-5.4"
+      susfs_version:
+        description: "Check out the 'Bump version to <this>' commit so kernel side and KSU side match (empty = branch tip). Give it with or without a leading v."
+        type: string
+        default: "2.2.0"
+
+      allow_partial_ksu_patch:
+        description: "Keep building even if some SUSFS hunks fail to apply to KernelSU-Next (off = stop, so you never get a kernel that silently lacks SELinux hide)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space and install tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi bc bison flex libssl-dev libelf-dev cpio zip curl git python3 libncurses5 lz4 rsync patch
+
+      - name: Assemble the OnePlus source
+        run: |
+          mkdir -p $HOME/ob && cd $HOME/ob
+          git clone -q --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git mods
+          git clone -q --depth=1 -b "${{ inputs.branch }}" https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git ksrc
+          rm -rf mods/.git ksrc/.git
+          rsync -aH mods/ ./ && rm -rf mods
+          mkdir -p kernel/msm-5.4 && rsync -aH ksrc/ kernel/msm-5.4/ && rm -rf ksrc
+          find -L . -name 'Kconfig*' -type f -exec sed -i 's/\r$//' {} +
+          echo "KDIR=$HOME/ob/kernel/msm-5.4" >> $GITHUB_ENV
+
+      - name: Backport path_umount/can_umount into fs/namespace.c
+        if: ${{ inputs.with_root }}
+        run: |
+          set -e
+          cd "$KDIR"
+          # KernelSU-Next's own setup script only adds a PROTOTYPE for path_umount if it's
+          # missing, not a real implementation -- harmless on 5.9+ kernels where the real
+          # function already exists, but leaves it undefined forever on pre-5.9 kernels like
+          # this one. Backport the real thing first (from kernelsu.org's own 'how to backport
+          # path_umount' guide / the same patch many custom kernels for old devices carry), so
+          # the setup script's own 'is it already there?' check finds a real implementation and
+          # skips its broken stub.
+          if grep -q 'int path_umount' fs/namespace.c; then
+            echo "path_umount already present in fs/namespace.c, nothing to backport"
+          else
+          python3 - << 'PYEOF'
+          import re
+          p = "fs/namespace.c"
+          s = open(p).read()
+          anchor = "static bool is_mnt_ns_file(struct dentry *dentry)"
+          assert anchor in s, "fs/namespace.c: anchor is_mnt_ns_file not found, cannot place backport"
+          backport = (
+              "static inline bool path_mounted(const struct path *path)\n"
+              "{\n"
+              "\treturn path->mnt->mnt_root == path->dentry;\n"
+              "}\n\n"
+              "static int can_umount(const struct path *path, int flags)\n"
+              "{\n"
+              "\tstruct mount *mnt = real_mount(path->mnt);\n\n"
+              "\tif (!may_mount())\n"
+              "\t\treturn -EPERM;\n"
+              "\tif (!path_mounted(path))\n"
+              "\t\treturn -EINVAL;\n"
+              "\tif (!check_mnt(mnt))\n"
+              "\t\treturn -EINVAL;\n"
+              "\tif (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optional, mostly for sanity */\n"
+              "\t\treturn -EINVAL;\n"
+              "\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n"
+              "\t\treturn -EPERM;\n"
+              "\treturn 0;\n"
+              "}\n\n"
+              "/* caller is responsible for flags being sane */\n"
+              "int path_umount(struct path *path, int flags)\n"
+              "{\n"
+              "\tstruct mount *mnt = real_mount(path->mnt);\n"
+              "\tint ret;\n\n"
+              "\tret = can_umount(path, flags);\n"
+              "\tif (!ret)\n"
+              "\t\tret = do_umount(mnt, flags);\n\n"
+              "\t/* we must not call path_put() as that would clear mnt_expiry_mark */\n"
+              "\tdput(path->dentry);\n"
+              "\tmntput_no_expire(mnt);\n"
+              "\treturn ret;\n"
+              "}\n\n"
+          )
+          s = s.replace(anchor, backport + anchor, 1)
+          open(p, "w").write(s)
+          print("fs/namespace.c: path_umount/can_umount backported")
+          PYEOF
+          if ! grep -q 'path_umount' fs/internal.h; then
+          python3 - << 'PYEOF'
+          p = "fs/internal.h"
+          s = open(p).read()
+          anchor = "extern void __init mnt_init(void);"
+          assert anchor in s, "fs/internal.h: anchor mnt_init not found, cannot declare path_umount"
+          s = s.replace(anchor, anchor + "\nint path_umount(struct path *path, int flags);\n", 1)
+          open(p, "w").write(s)
+          print("fs/internal.h: path_umount declared")
+          PYEOF
+          fi
+          fi
+
+      - name: Add KernelSU-Next and SUSFS (old, matching versions)
+        if: ${{ inputs.with_root }}
+        run: |
+          set -e
+          cd $HOME
+          git clone -q "${{ inputs.ksu_repo }}" KSUN
+          cd KSUN
+          echo "KernelSU-Next tags (newest 30):"; git tag --sort=-creatordate | head -30
+          git checkout -q "${{ inputs.ksu_ref }}" || { echo "ref ${{ inputs.ksu_ref }} not found; pick one of the tags above"; exit 1; }
+          git log -1 --format='KernelSU-Next at %H %s'
+          echo "KSU_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+          cd $HOME
+          git clone -q --filter=blob:none "${{ inputs.susfs_repo }}" susfs-src
+          cd susfs-src
+          git checkout -q "${{ inputs.susfs_ref }}"
+          echo "susfs branches:"; git branch -r | head -40
+          echo "Version bump commits on this branch:"; git log --oneline --grep='Bump version' | head -15
+          if [ -n "${{ inputs.susfs_version }}" ]; then
+            # Real commit messages say "Bump version to 2.4.0" -- no leading v -- so strip
+            # one off the input if the person included it, and try both forms either way.
+            VRAW="${{ inputs.susfs_version }}"
+            VBARE="${VRAW#v}"
+            C=$(git log --format=%H --grep="Bump version to v\?${VBARE}\b" -E -n 1 || true)
+            if [ -n "$C" ]; then
+              git checkout -q "$C"; echo "susfs at $C ($(git log -1 --format=%s))"
+            else
+              echo "WARNING: no 'Bump version to ${VBARE}' (or v${VBARE}) commit on this branch -- staying at branch tip:"
+              git log -1 --format='tip is %H %s'
+            fi
+          fi
+          git log -1 --format='susfs commit %H %s'
+          grep -rn 'define SUSFS_VERSION' kernel_patches/include/linux/ 2>/dev/null | head -3 || true
+          ls kernel_patches kernel_patches/KernelSU 2>/dev/null | head -30
+
+          # KSU side: add SUSFS to KernelSU-Next (before it is linked into the kernel tree)
+          cd $HOME/KSUN
+          PURL="${{ inputs.ksu_susfs_patch_url }}"
+          if [ -n "$PURL" ]; then
+            curl -fL --retry 3 -o $HOME/ksu-susfs.patch "$PURL"
+          else
+            cp $HOME/susfs-src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch $HOME/ksu-susfs.patch
+          fi
+          mkdir -p $HOME/patches
+          cp $HOME/ksu-susfs.patch $HOME/patches/00-ksu-side.patch
+          patch -p1 --forward -F3 --no-backup-if-mismatch < $HOME/ksu-susfs.patch || true
+          find . -name '*.orig' -delete
+          KREJ=$(find . -name '*.rej' | sort)
+          if [ -n "$KREJ" ]; then
+            echo "Some hunks did not apply (full text is in the info artifact, rejects/)."
+            for f in $KREJ; do echo "=========== $f ==========="; cat "$f"; done
+            if [ "${{ inputs.allow_partial_ksu_patch }}" != "true" ]; then
+              echo "ERROR: SUSFS does not fully apply to KernelSU-Next ${{ inputs.ksu_ref }} with SUSFS ${{ inputs.susfs_version }}."
+              echo "Building anyway would drop SUSFS/SELinux-hide pieces and mismatch the manager. Try another susfs_version or ksu_ref, or set allow_partial_ksu_patch."
+              exit 1
+            fi
+            # A partially-patched file (some hunks in, some rejected) can be syntactically
+            # broken (mismatched braces, calls to functions whose declaration hunk was
+            # rejected). Revert each such file to its clean pre-patch state instead of
+            # compiling a half-patched mess -- this drops SUSFS's SELinux-hiding pieces for
+            # now, but keeps the tree buildable.
+            echo "Reverting partially-patched files to their clean state (proven unsafe to leave half-applied):"
+            for rej in $KREJ; do
+              f="${rej%.rej}"
+              git checkout -q -- "$f" 2>/dev/null && echo "  reverted: $f" || echo "  (not tracked / nothing to revert: $f)"
+              rm -f "$rej" "$f.orig"
+            done
+          else
+            echo "KSU-side SUSFS patch applied cleanly"
+          fi
+
+          echo "----- Ground truth: where susfs_is_current_ksu_domain actually landed in selinux.c -----"
+          grep -n -B15 'bool susfs_is_current_ksu_domain' kernel/selinux/selinux.c 2>/dev/null || echo "(function not found at all in selinux.c)"
+          echo "----- Same for selinux.h's declaration -----"
+          grep -n -B5 -A1 'bool susfs_is_current_ksu_domain' kernel/selinux/selinux.h 2>/dev/null || echo "(declaration not found at all in selinux.h)"
+
+          cd "$KDIR"
+          ln -sfn "$HOME/KSUN/kernel" drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          python3 - << 'PY2'
+          p = "drivers/Kconfig"
+          s = open(p).read()
+          if 'source "drivers/kernelsu/Kconfig"' not in s:
+              i = s.rfind("endmenu")
+              assert i != -1, "drivers/Kconfig has no endmenu"
+              s = s[:i] + 'source "drivers/kernelsu/Kconfig"\n' + s[i:]
+              open(p, "w").write(s)
+              print("drivers/Kconfig: added kernelsu source line")
+          PY2
+          test -f drivers/kernelsu/Kconfig || { echo "KernelSU-Next has no kernel/Kconfig here"; ls -la "$HOME/KSUN" | head -30; exit 1; }
+          grep -rq "config KSU_SUSFS\b" drivers/kernelsu/ || { echo "ERROR: KSU_SUSFS still not defined after the KSU-side patch"; exit 1; }
+          echo "KernelSU-Next + SUSFS Kconfig OK"; ls drivers/kernelsu | head -30
+
+      - name: Apply the SUSFS kernel patch (5.4)
+        if: ${{ inputs.with_root }}
+        run: |
+          set -e
+          cd "$KDIR"
+          S=$HOME/susfs-src/kernel_patches
+          cp $S/fs/* fs/
+          cp $S/include/linux/* include/linux/
+          P=$(ls $S/50_add_susfs_in_kernel-*.patch | head -1)
+          echo "applying $P"
+          cp "$P" $HOME/patches/01-kernel-side.patch
+          # $KDIR has no .git (stripped earlier), so "git checkout" can't revert a
+          # partially-patched file here. Back up every file this patch touches first,
+          # so a reject can be undone by restoring from that backup instead.
+          rm -rf /tmp/kdir-backup && mkdir -p /tmp/kdir-backup
+          awk '/^\+\+\+ b\// {print substr($2,3)}' "$P" | sort -u | while read -r f; do
+            if [ -f "$f" ]; then
+              mkdir -p "/tmp/kdir-backup/$(dirname "$f")"
+              cp "$f" "/tmp/kdir-backup/$f"
+            fi
+          done
+          patch -p1 --forward -F3 --no-backup-if-mismatch < "$P" || true
+          find . -name '*.orig' -delete
+          remaining=$(find . -name '*.rej' | sort)
+          if [ -n "$remaining" ]; then
+            echo "Some hunks did not apply (full text is in the info artifact, rejects/)."
+            for f in $remaining; do echo "=========== $f ==========="; cat "$f"; done
+            echo "Reverting partially-patched files to their clean (pre-patch) state (proven unsafe to leave half-applied):"
+            for rej in $remaining; do
+              f="${rej%.rej}"
+              if [ -f "/tmp/kdir-backup/$f" ]; then
+                cp "/tmp/kdir-backup/$f" "$f"
+                echo "  reverted: $f"
+              else
+                echo "  (no backup -- likely a brand-new file added by the patch, leaving as-is): $f"
+              fi
+              rm -f "$rej"
+            done
+          fi
+          test -f fs/susfs.c && echo "fs/susfs.c present"
+          test -f include/linux/susfs.h && echo "include/linux/susfs.h present"
+          echo "Kernel-side SUSFS applied cleanly"
+
+      - name: Restore cached compiler
+        id: clangcache
+        uses: actions/cache@v4
+        with:
+          path: ~/aclang
+          key: aclang-r383902b
+
+      - name: Get the stock compiler (Android clang 11, r383902b)
+        if: steps.clangcache.outputs.cache-hit != 'true'
+        run: |
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          mkdir -p $HOME/aclang
+          OK=""
+          # googlesource sometimes answers 503: retry the whole list a few times
+          for ROUND in 1 2 3 4 5; do
+            for BR in android11-qpr1-release android11-release android11-qpr2-release android11-qpr3-release master-kernel-build-2020 master-kernel-build-2021; do
+              U="$BASE/$BR/clang-r383902b.tar.gz"
+              echo "round $ROUND: $BR"
+              rm -f /tmp/clang.tgz
+              if curl -fL --retry 3 --retry-all-errors --retry-delay 5 -o /tmp/clang.tgz "$U" && gzip -t /tmp/clang.tgz; then
+                OK=1; break 2
+              fi
+            done
+            echo "all sources failed in round $ROUND, waiting 60s"
+            sleep 60
+          done
+          [ -n "$OK" ] || { echo "No compiler download worked after 5 rounds"; exit 1; }
+          tar -xzf /tmp/clang.tgz -C $HOME/aclang
+          rm -f /tmp/clang.tgz
+          test -x $HOME/aclang/bin/clang || { echo "clang binary missing after extract"; exit 1; }
+
+      - name: Put the compiler on PATH
+        run: |
+          echo "$HOME/aclang/bin" >> $GITHUB_PATH
+          $HOME/aclang/bin/clang --version | head -1
+
+      - name: Apply the stock config (+ SUSFS options if root is on)
+        run: |
+          export PATH=$HOME/aclang/bin:$PATH
+          cd "$KDIR"
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/op9-stock.config" out/.config
+          echo "-g${{ inputs.kernel_hash }}" > .scmversion
+          ARGS="O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-"
+          echo "ARGS=$ARGS" >> $GITHUB_ENV
+          make $ARGS olddefconfig 2>&1 | tee ../../olddefconfig.log | tail -5
+          printf '# CONFIG_RELR is not set\nCONFIG_OPLUS_FINGERPRINT=y\nCONFIG_OPLUS_FINGERPRINT_COMMON=y\nCONFIG_OPLUS_FINGERPRINT_QCOM=y\nCONFIG_OPLUS_FINGERPRINT_GOODIX_OPTICAL=y\nCONFIG_OPLUS_FINGERPRINT_SILEAD=y\nCONFIG_OPLUS_FINGERPRINT_JIIOV_OPTICAL=y\n' > ../../extra.fragment
+          scripts/kconfig/merge_config.sh -m -O out out/.config ../../extra.fragment > /dev/null 2>&1
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            printf 'CONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\nCONFIG_KSU_SUSFS_SUS_PATH=y\nCONFIG_KSU_SUSFS_SUS_KSTAT=y\nCONFIG_KSU_SUSFS_SUS_MAP=y\nCONFIG_KSU_SUSFS_SPOOF_UNAME=y\n# CONFIG_KSU_SUSFS_ENABLE_LOG is not set\nCONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y\nCONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y\nCONFIG_KSU_SUSFS_OPEN_REDIRECT=y\nCONFIG_KSU_SUSFS_SUS_MOUNT=y\nCONFIG_KSU_SUSFS_TRY_UMOUNT=y\n# CONFIG_KSU_SUSFS_SUS_SU is not set\n# CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT is not set\n# CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT is not set\n# CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT is not set\n# CONFIG_KSU_SAMSUNG_KDP is not set\n# CONFIG_KSU_SAMSUNG_RKP is not set\n# CONFIG_KSU_SAMSUNG_DEFEX is not set\n# CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT is not set\n' > ../../susfs.fragment
+            scripts/kconfig/merge_config.sh -m -O out out/.config ../../susfs.fragment > /dev/null 2>&1
+          fi
+          make $ARGS olddefconfig 2>&1 | tee -a ../../olddefconfig.log | tail -5
+          KREL=$(make $ARGS -s kernelrelease 2>/dev/null | tail -n 1)
+          [ -n "$KREL" ] || { echo "could not read kernelrelease"; exit 1; }
+          echo "KREL=$KREL" >> $GITHUB_ENV
+          {
+            echo "## Kernel release this build would report"
+            make $ARGS -s kernelrelease 2>&1 | tail -1
+            echo "## Stock release: 5.4.254-qgki-g${{ inputs.kernel_hash }}"
+            echo "## Fingerprint / RELR / LTO / CFI / modversions now"
+            grep -E 'FINGERPRINT|RELR|LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES' out/.config
+          } | tee -a $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            grep -E "^CONFIG_KSU(_SUSFS)?=y" out/.config || { echo "KSU/SUSFS CONFIG DID NOT STICK:"; grep -i ksu out/.config | head -30; exit 1; }
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "CONFIG_KSU_SUSFS did not stick:"; grep -n -i 'ksu' out/.config | head -40; exit 1; }
+            echo "SUSFS/KSU options that stuck:"; grep -E '^CONFIG_KSU' out/.config
+            echo "----- Searching for what gates the still-undefined symbols (devpts hiding, domain checks, umount) -----"
+            (grep -rln 'ksu_devpts_hook\|ksu_handle_devpts' drivers/kernelsu/ 2>/dev/null | while read -r f; do echo "defines/declares in: $f"; grep -n 'ksu_devpts_hook\|ksu_handle_devpts\|config.*DEVPTS\|CONFIG_KSU.*DEVPTS' "$f"; done) || true
+            grep -rln 'susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain' drivers/kernelsu/ 2>/dev/null || true
+            (grep -rln 'ksu_try_umount\b' drivers/kernelsu/ 2>/dev/null | while read -r f; do echo "defines/declares in: $f"; grep -n 'ksu_try_umount\|config.*UMOUNT' "$f"; done) || true
+            grep -n 'DEVPTS\|KSU_SUSFS_TRY_UMOUNT\|KSU_SUSFS_SUS_SU' drivers/kernelsu/Kconfig 2>/dev/null || true
+            grep -rln 'path_umount' drivers/kernelsu/ fs/namespace.c 2>/dev/null || true
+            echo "Root config OK: KSU + SUSFS set" | tee -a $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Compile the kernel
+        if: ${{ inputs.build_image }}
+        run: |
+          export PATH=$HOME/aclang/bin:$PATH
+          cd "$KDIR"
+          set -o pipefail
+          make -k -j$(nproc) $ARGS Image.gz 2>&1 | tee ../../build.log | tail -5
+
+      - name: Show the real error
+        if: failure()
+        run: |
+          cd $HOME/ob
+          grep -nE "error:|Error [0-9]+|undefined|can't open|No such file" build.log olddefconfig.log 2>/dev/null | head -30
+
+      - name: Package with AnyKernel3
+        if: ${{ inputs.build_image }}
+        run: |
+          set -e
+          # the built image must report exactly the release we expect
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            # KernelSU-Next: verify the driver and hook entry points were really compiled in
+            test -f "$KDIR/out/drivers/kernelsu/built-in.a" || test -f "$KDIR/out/drivers/kernelsu/ksu.o" || { echo "KernelSU-Next driver was not built"; ls "$KDIR/out/drivers/kernelsu" 2>/dev/null; exit 1; }
+            test -f "$KDIR/out/fs/susfs.o" || { echo "fs/susfs.o was not built"; exit 1; }
+          fi
+          zcat "$KDIR/out/arch/arm64/boot/Image.gz" | grep -a -q "Linux version $KREL " || { echo "Built image does not report $KREL"; exit 1; }
+          KV=$(zcat "$KDIR/out/arch/arm64/boot/Image.gz" | strings -a | grep -m1 'welcome to KernelSU version' || true)
+          SV=$(zcat "$KDIR/out/arch/arm64/boot/Image.gz" | strings -a | grep -m1 'susfs is initialized' || true)
+          echo "Kernel reports: $KV | $SV"
+          { echo "## Built-in versions (the manager APK must show the same KernelSU version code)"; echo "- $KV"; echo "- $SV"; echo "- KernelSU-Next commit: $KSU_SHA"; } >> $GITHUB_STEP_SUMMARY
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/README.md
+          cp "$KDIR/out/arch/arm64/boot/Image.gz" ak3/
+          cat > ak3/anykernel.sh << 'AKEOF'
+          properties() { '
+          kernel.string=OnePlus 9 / 9 Pro KernelSU-Next + SUSFS kernel (@KREL@)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=lemonadep
+          device.name2=lemonade
+          device.name3=OnePlus9Pro
+          device.name4=OnePlus9
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+
+          # (kernel-release guard removed: it could not read the version from this boot image)
+
+          # best-effort backup of the current boot partition (only when storage is mounted)
+          if [ -d /sdcard/Download ] && [ -n "$block" ]; then
+            BK=/sdcard/Download/boot_backup_$(date +%Y%m%d_%H%M%S).img;
+            dd if="$block" of="$BK" bs=1048576 2>/dev/null && ui_print "Backed up current boot to $BK" || ui_print "Boot backup skipped";
+          fi;
+
+          write_boot;
+          AKEOF
+          sed -i "s|@KREL@|$KREL|g" ak3/anykernel.sh
+          grep -n "KREL\|Linux version" ak3/anykernel.sh | head
+          if [ "${{ inputs.with_root }}" = "true" ]; then N=OP9-KSUNext-SUSFS-kernel; else N=OP9-baseline-kernel; fi
+          echo "ZIPNAME=$N" >> $GITHUB_ENV
+          cd ak3 && zip -r9 ../$N.zip . -x '.git*'
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.build_image }}
+        with:
+          name: ${{ env.ZIPNAME }}
+          path: ${{ env.ZIPNAME }}.zip
+
+      - name: Publish a GitHub Release
+        if: ${{ inputs.build_image }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd "$KDIR"
+          SHA=$(sha256sum "$GITHUB_WORKSPACE/$ZIPNAME.zip" | cut -d' ' -f1)
+          if grep -q '^CONFIG_THINLTO=y' out/.config; then LTO="ThinLTO"; elif grep -q '^CONFIG_LTO_CLANG=y' out/.config; then LTO="LTO"; else LTO="none"; fi
+          TCPCC=$(grep '^CONFIG_DEFAULT_TCP_CONG=' out/.config | cut -d'"' -f2)
+          TAG="op9-$(date -u +%Y%m%d-%H%M)-${{ github.run_number }}"
+          if [ "${{ inputs.with_root }}" = "true" ]; then
+            cat > $GITHUB_WORKSPACE/release-notes.md << NOTES
+          OnePlus 9 / 9 Pro kernel for OxygenOS 14 (Android 14)
+
+          **INFO**
+          - Kernel: $KREL
+          - Kernel source: OnePlusOSS/android_kernel_oneplus_sm8350, branch ${{ inputs.branch }}
+          - Root: KernelSU-Next ${{ inputs.ksu_ref }} ($KSU_SHA)
+          - SUSFS: ${{ inputs.susfs_version }}
+          - LTO: $LTO
+          - TCP congestion control: $TCPCC
+          - Devices: lemonadep (OnePlus 9 Pro), lemonade (OnePlus 9)
+          - SHA256: \`$SHA\`
+
+          **DOWNLOADS**
+          - \`$ZIPNAME.zip\` — flash this to your boot partition
+          - Install the KernelSU-Next manager built from the same commit/CI run; it is not attached here
+
+          **⚠️ WARNINGS**
+          - Only for a ROM whose kernel version starts with \`5.4.254-qgki-g${{ inputs.kernel_hash }}\`. Flashing on a different OxygenOS build can bootloop the phone.
+          - Back up your current boot image first (Kernel Flasher → Backup, or your custom recovery's backup option). This zip also makes its own backup to \`Download/boot_backup_*.img\`, but keep your own copy too.
+          - This is a community/unofficial build. Flash at your own risk — not responsible for bootloops, data loss, or bricked devices.
+          - Keep a stock \`boot.img\` on your PC and know how to reach fastboot, in case the flash fails.
+
+          **INSTALL**
+          1. Install the matching KernelSU-Next manager APK.
+          2. Flash the AnyKernel3 zip with Kernel Flasher or your custom recovery.
+          3. Reboot.
+          4. Open the KernelSU-Next manager and confirm it shows "Working" and the correct kernel/SUSFS version.
+
+          **IF IT DOESN'T BOOT**
+          Flash your stock \`boot.img\` from fastboot to recover, then open an issue here with what happened.
+
+          Source and build recipe: this repository, workflow \`op9-ksunext-build.yml\`
+          NOTES
+          else
+            cat > $GITHUB_WORKSPACE/release-notes.md << NOTES
+          OnePlus 9 / 9 Pro baseline kernel (no root) for OxygenOS 14 (Android 14)
+
+          - Kernel: $KREL
+          - Kernel source: OnePlusOSS/android_kernel_oneplus_sm8350, branch ${{ inputs.branch }}
+          - LTO: $LTO
+          - TCP congestion control: $TCPCC
+          - SHA256: \`$SHA\`
+
+          **⚠️ WARNINGS**
+          - Only for a ROM whose kernel version starts with \`5.4.254-qgki-g${{ inputs.kernel_hash }}\`.
+          - Back up your boot image first. Flash at your own risk.
+
+          Source and build recipe: this repository, workflow \`op9-ksunext-build.yml\`
+          NOTES
+          fi
+          cd "$GITHUB_WORKSPACE"
+          gh release create "$TAG" "$GITHUB_WORKSPACE/$ZIPNAME.zip" \
+            --title "$ZIPNAME ($KREL)" \
+            --notes-file "$GITHUB_WORKSPACE/release-notes.md"
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/results
+          cp "$KDIR/out/.config" $GITHUB_WORKSPACE/results/final.config 2>/dev/null || true
+          cp $HOME/ob/olddefconfig.log $HOME/ob/build.log $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          mkdir -p $GITHUB_WORKSPACE/results/rejects
+          # KSU-side rejects live under $HOME/KSUN (KernelSU-Next's own checkout), not $KDIR —
+          # collect both, or a KSU-side-only failure (like before) leaves the artifact with no clue why.
+          for D in "$KDIR" "$HOME/KSUN"; do
+            (cd "$D" 2>/dev/null && find . -name '*.rej' | while read -r r; do cp "$r" "$GITHUB_WORKSPACE/results/rejects/$(basename "$D")__$(echo "$r" | sed 's|^\./||; s|/|__|g')"; done) || true
+          done
+          cp "$KDIR/out/arch/arm64/boot/Image.gz" $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          cp $HOME/patches/*.patch $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          cp $HOME/patches/*.stat $GITHUB_WORKSPACE/results/ 2>/dev/null || true
+          ls -l $GITHUB_WORKSPACE/results 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: op9-bakasu-build-info
+          include-hidden-files: true
+          path: results/
+          if-no-files-found: ignore
